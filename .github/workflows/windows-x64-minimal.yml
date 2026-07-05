@@ -9,6 +9,12 @@ on:
   # Actions:write permission that workflow_dispatch needs).
   push:
     branches: [ci]
+    # A version tag (v1.2.3) builds AND publishes a GitHub release with the
+    # zipped bridge binary, so the installer can fetch it self-contained.
+    tags: ["v*"]
+
+permissions:
+  contents: write  # create the release on a tag
 
 env:
   RUST_VERSION: "1.75"
@@ -107,3 +113,18 @@ jobs:
           # not ./rustdesk.
           path: flutter/build/windows/x64/runner/Release
           if-no-files-found: error
+
+      # On a version tag, zip the build and publish it as a GitHub release so the
+      # installer can fetch a stable, versioned bridge binary (artifacts expire).
+      - name: Package + publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip_name="rustdesk-bridge-${GITHUB_REF_NAME}-windows-x86_64.zip"
+          ( cd flutter/build/windows/x64/runner/Release && 7z a -tzip "$GITHUB_WORKSPACE/$zip_name" ./* )
+          gh release create "$GITHUB_REF_NAME" "$GITHUB_WORKSPACE/$zip_name" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RustDesk MCP bridge $GITHUB_REF_NAME" \
+            --notes "Unsigned Windows x64 bridge binary. After extracting, configure it with install/gen_config.py (MCP enable + token + rendezvous server/key). See docs/packaging.md."
