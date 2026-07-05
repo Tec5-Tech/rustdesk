@@ -659,6 +659,28 @@ impl FlutterHandler {
             .store(crate::ui_interface::use_texture_render(), Ordering::Relaxed);
         self.display_rgbas.write().unwrap().clear();
     }
+
+    // Owned-bridge addition: feed decoded frames into the MCP frame cache so
+    // get_desktop_frame works headlessly (display_rgbas alone only populates
+    // when the Flutter UI actively renders).
+    #[inline]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn agent_bridge_record_frame(&self, display: usize, rgba: &scrap::ImageRgb) {
+        let handlers = self.session_handlers.read().unwrap();
+        let mut session_ids = Vec::new();
+        let is_multi_session = handlers.len() > 1;
+        for (session_id, handler) in handlers.iter() {
+            if handler.event_stream.is_none() {
+                continue;
+            }
+            if !is_multi_session || handler.displays.is_empty() || handler.displays.contains(&display)
+            {
+                session_ids.push(*session_id);
+            }
+        }
+        drop(handlers);
+        crate::agent_bridge::record_frame(&session_ids, display, rgba);
+    }
 }
 
 impl InvokeUiSession for FlutterHandler {
@@ -1125,6 +1147,19 @@ impl InvokeUiSession for FlutterHandler {
 
     fn handle_terminal_response(&self, response: TerminalResponse) {
         use hbb_common::message_proto::terminal_response::Union;
+        // Owned-bridge addition: feed terminal output into the MCP terminal cache
+        // so terminal_output returns data (the cache is otherwise never populated).
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let session_ids = self
+                .session_handlers
+                .read()
+                .unwrap()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            crate::agent_bridge::record_terminal_response(&session_ids, &response);
+        }
 
         match response.union {
             Some(Union::Opened(opened)) => {
@@ -1197,6 +1232,8 @@ impl FlutterHandler {
                 }
             }
         }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        self.agent_bridge_record_frame(display, rgba);
         // If the current rgba is not fetched by flutter, i.e., is valid.
         // We give up sending a new event to flutter.
         let mut rgba_write_lock = self.display_rgbas.write().unwrap();
@@ -1256,6 +1293,8 @@ impl FlutterHandler {
         display: usize,
         rgba: &mut scrap::ImageRgb,
     ) {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        self.agent_bridge_record_frame(display, rgba);
         for (_, session) in self.session_handlers.read().unwrap().iter() {
             if use_texture_render || session.displays.len() > 1 {
                 if session.renderer.on_rgba(display, rgba) {
