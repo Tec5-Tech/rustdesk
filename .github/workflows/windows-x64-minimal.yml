@@ -5,6 +5,10 @@ name: Windows x64 (minimal, manual)
 
 on:
   workflow_dispatch:
+  # Push to the dedicated `ci` branch to trigger a build (works without the
+  # Actions:write permission that workflow_dispatch needs).
+  push:
+    branches: [ci]
 
 env:
   RUST_VERSION: "1.75"
