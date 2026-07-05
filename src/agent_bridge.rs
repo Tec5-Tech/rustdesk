@@ -585,16 +585,10 @@ fn input_password(session_handle: &str, password: &str) -> Result<Value, String>
     ensure_mcp_enabled()?;
     let session_id = resolve_actual_session_any(session_handle)?;
     let session = any_session(session_handle)?;
-    session.queue_password(password.to_string());
-    if session.has_login_challenge() {
-        flutter_ffi::session_login(
-            session_id,
-            String::new(),
-            String::new(),
-            password.to_string(),
-            false,
-        );
-    }
+    // master exposes password submission through Session::login (Data::Login),
+    // which is what the Flutter UI uses; the reference fork's queue_password /
+    // has_login_challenge staging methods do not exist here.
+    session.login(String::new(), String::new(), password.to_string(), false);
     let connected = wait_for_session_ready(session_id, SESSION_READY_TIMEOUT);
     let snapshot = session_snapshot(session_id);
 
