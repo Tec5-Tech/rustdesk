@@ -577,6 +577,9 @@ pub fn session_handle_flutter_key_event(
     down_or_up: bool,
 ) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if crate::agent_bridge::should_drop_user_input(session.lc.read().unwrap().get_id()) {
+            return;
+        }
         let keyboard_mode = session.get_keyboard_mode();
         session.handle_flutter_key_event(
             &keyboard_mode,
@@ -1881,6 +1884,11 @@ pub fn main_load_group() -> String {
 }
 
 pub fn session_send_pointer(session_id: SessionID, msg: String) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if crate::agent_bridge::should_drop_user_input(session.lc.read().unwrap().get_id()) {
+            return;
+        }
+    }
     super::flutter::session_send_pointer(session_id, msg);
 }
 
@@ -1913,6 +1921,11 @@ pub fn session_send_pointer(session_id: SessionID, msg: String) {
 /// If these assumptions are violated (e.g., `relative_mouse_mode` is added to normal events),
 /// legitimate mouse events may be silently dropped by the early-return logic below.
 pub fn session_send_mouse(session_id: SessionID, msg: String) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if crate::agent_bridge::should_drop_user_input(session.lc.read().unwrap().get_id()) {
+            return;
+        }
+    }
     if let Ok(m) = serde_json::from_str::<HashMap<String, String>>(&msg) {
         // Relative mouse mode marker validation (Flutter-only).
         // This only validates and filters markers; the server tracks per-connection

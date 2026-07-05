@@ -686,6 +686,9 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn input_os_password(&self, pass: String, activate: bool) {
+        if crate::agent_bridge::should_drop_user_input(&self.get_id()) {
+            return;
+        }
         input_os_password(pass, activate, self.clone());
     }
 
@@ -772,12 +775,13 @@ impl<T: InvokeUiSession> Session<T> {
         }
     }
 
-    // Owned-bridge: the agent's own injected input. For v1 these delegate to the
-    // normal paths (master has no local-input-lock guard yet). When the
-    // should_drop_user_input guard is added, keep these as the *bypassing* path.
+    // Owned-bridge: the agent's own injected input. These hold the real
+    // implementation and bypass should_drop_user_input; the normal
+    // send_mouse/send_key_event methods below guard human-operator input and
+    // then delegate here.
     pub fn send_mouse_agent(
         &self,
-        mask: i32,
+        mut mask: i32,
         x: i32,
         y: i32,
         alt: bool,
@@ -785,14 +789,64 @@ impl<T: InvokeUiSession> Session<T> {
         shift: bool,
         command: bool,
     ) {
-        self.send_mouse(mask, x, y, alt, ctrl, shift, command);
+        #[allow(unused_mut)]
+        let mut command = command;
+        #[cfg(windows)]
+        {
+            if !command && crate::platform::windows::get_win_key_state() {
+                command = true;
+            }
+        }
+
+        // Compute event type once using MOUSE_TYPE_MASK for reuse
+        let event_type = mask & MOUSE_TYPE_MASK;
+        let (x, y) = if event_type == MOUSE_TYPE_WHEEL || event_type == MOUSE_TYPE_TRACKPAD {
+            self.get_scroll_xy((x, y))
+        } else {
+            (x, y)
+        };
+
+        // #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let (alt, ctrl, shift, command) =
+            keyboard::client::get_modifiers_state(alt, ctrl, shift, command);
+        let is_left = (mask & (MOUSE_BUTTON_LEFT << 3)) > 0;
+        let is_right = (mask & (MOUSE_BUTTON_RIGHT << 3)) > 0;
+        if is_left ^ is_right {
+            let swap_lr = self.get_toggle_option("swap-left-right-mouse".to_string());
+            if swap_lr {
+                if is_left {
+                    mask = (mask & (!(MOUSE_BUTTON_LEFT << 3))) | (MOUSE_BUTTON_RIGHT << 3);
+                } else {
+                    mask = (mask & (!(MOUSE_BUTTON_RIGHT << 3))) | (MOUSE_BUTTON_LEFT << 3);
+                }
+            }
+        }
+
+        send_mouse(mask, x, y, alt, ctrl, shift, command, self);
+        // on macos, ctrl + left button down = right button down, up won't emit, so we need to
+        // emit up myself if peer is not macos
+        // to-do: how about ctrl + left from win to macos
+        if cfg!(target_os = "macos") {
+            let buttons = mask >> 3;
+            if buttons == MOUSE_BUTTON_LEFT
+                && event_type == MOUSE_TYPE_DOWN
+                && ctrl
+                && self.peer_platform() != "Mac OS"
+            {
+                self.send_mouse(
+                    (MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_UP) as _,
+                    x,
+                    y,
+                    alt,
+                    ctrl,
+                    shift,
+                    command,
+                );
+            }
+        }
     }
 
     pub fn send_key_event_agent(&self, evt: &KeyEvent) {
-        self.send_key_event(evt);
-    }
-
-    pub fn send_key_event(&self, evt: &KeyEvent) {
         // mode: legacy(0), map(1), translate(2), auto(3)
 
         let mut msg = evt.clone();
@@ -800,6 +854,13 @@ impl<T: InvokeUiSession> Session<T> {
         let mut msg_out = Message::new();
         msg_out.set_key_event(msg);
         self.send(Data::Message(msg_out));
+    }
+
+    pub fn send_key_event(&self, evt: &KeyEvent) {
+        if crate::agent_bridge::should_drop_user_input(&self.get_id()) {
+            return;
+        }
+        self.send_key_event_agent(evt);
     }
 
     pub fn send_chat(&self, text: String) {
@@ -933,6 +994,9 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn input_string(&self, value: &str) {
+        if crate::agent_bridge::should_drop_user_input(&self.get_id()) {
+            return;
+        }
         let mut key_event = KeyEvent::new();
         key_event.set_seq(value.to_owned());
         let mut msg_out = Message::new();
@@ -1240,7 +1304,7 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn send_mouse(
         &self,
-        mut mask: i32,
+        mask: i32,
         x: i32,
         y: i32,
         alt: bool,
@@ -1248,61 +1312,10 @@ impl<T: InvokeUiSession> Session<T> {
         shift: bool,
         command: bool,
     ) {
-        #[allow(unused_mut)]
-        let mut command = command;
-        #[cfg(windows)]
-        {
-            if !command && crate::platform::windows::get_win_key_state() {
-                command = true;
-            }
+        if crate::agent_bridge::should_drop_user_input(&self.get_id()) {
+            return;
         }
-
-        // Compute event type once using MOUSE_TYPE_MASK for reuse
-        let event_type = mask & MOUSE_TYPE_MASK;
-        let (x, y) = if event_type == MOUSE_TYPE_WHEEL || event_type == MOUSE_TYPE_TRACKPAD {
-            self.get_scroll_xy((x, y))
-        } else {
-            (x, y)
-        };
-
-        // #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        let (alt, ctrl, shift, command) =
-            keyboard::client::get_modifiers_state(alt, ctrl, shift, command);
-        let is_left = (mask & (MOUSE_BUTTON_LEFT << 3)) > 0;
-        let is_right = (mask & (MOUSE_BUTTON_RIGHT << 3)) > 0;
-        if is_left ^ is_right {
-            let swap_lr = self.get_toggle_option("swap-left-right-mouse".to_string());
-            if swap_lr {
-                if is_left {
-                    mask = (mask & (!(MOUSE_BUTTON_LEFT << 3))) | (MOUSE_BUTTON_RIGHT << 3);
-                } else {
-                    mask = (mask & (!(MOUSE_BUTTON_RIGHT << 3))) | (MOUSE_BUTTON_LEFT << 3);
-                }
-            }
-        }
-
-        send_mouse(mask, x, y, alt, ctrl, shift, command, self);
-        // on macos, ctrl + left button down = right button down, up won't emit, so we need to
-        // emit up myself if peer is not macos
-        // to-do: how about ctrl + left from win to macos
-        if cfg!(target_os = "macos") {
-            let buttons = mask >> 3;
-            if buttons == MOUSE_BUTTON_LEFT
-                && event_type == MOUSE_TYPE_DOWN
-                && ctrl
-                && self.peer_platform() != "Mac OS"
-            {
-                self.send_mouse(
-                    (MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_UP) as _,
-                    x,
-                    y,
-                    alt,
-                    ctrl,
-                    shift,
-                    command,
-                );
-            }
-        }
+        self.send_mouse_agent(mask, x, y, alt, ctrl, shift, command);
     }
 
     pub fn reconnect(&self, force_relay: bool) {
