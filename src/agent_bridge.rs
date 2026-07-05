@@ -133,6 +133,10 @@ fn handle_mcp_http_post(request: HttpRequest) -> HttpResponse {
             ),
         );
     }
+    // Owned-bridge addition: local auth (the reference endpoint has none).
+    if !check_mcp_auth(&request) {
+        return HttpResponse::text(401, "Unauthorized", "missing or invalid MCP auth token");
+    }
     match handle_message(message) {
         Some(response) => HttpResponse::json(200, "OK", response),
         None => HttpResponse::empty(202, "Accepted"),
@@ -347,6 +351,31 @@ fn tools_list() -> Value {
                     "required": ["session", "keys"],
                     "additionalProperties": false
                 })
+            ),
+            tool_def(
+                "close_session",
+                "Close a remote session and tear down the RustDesk connection.",
+                json!({
+                    "type": "object",
+                    "properties": { "session": { "type": "string" } },
+                    "required": ["session"],
+                    "additionalProperties": false
+                })
+            ),
+            tool_def(
+                "get_session_status",
+                "Get the live connection status of a remote session.",
+                json!({
+                    "type": "object",
+                    "properties": { "session": { "type": "string" } },
+                    "required": ["session"],
+                    "additionalProperties": false
+                })
+            ),
+            tool_def(
+                "list_sessions",
+                "List active sessions known to the bridge, each with live connection status.",
+                json!({ "type": "object", "properties": {}, "additionalProperties": false })
             )
         ]
     })
@@ -430,6 +459,11 @@ fn handle_tool_call(params: Option<&Value>) -> Result<Value, ProtocolError> {
                 &keys,
             ))
         }
+        "close_session" => tool_payload_result(close_session(required_str(args, "session")?)),
+        "get_session_status" => {
+            tool_payload_result(get_session_status(required_str(args, "session")?))
+        }
+        "list_sessions" => tool_payload_result(list_sessions()),
         _ => {
             return Err(ProtocolError::new(
                 -32601,
@@ -911,6 +945,11 @@ fn keyboard_hotkey(session_handle: &str, keys: &[String]) -> Result<Value, Strin
 }
 
 fn mcp_enabled() -> bool {
+    // Owned-bridge addition: env-first headless enable, so an autonomous/unattended
+    // host can turn MCP on without the GUI toggle (the #1 autonomy prerequisite).
+    if let Ok(v) = std::env::var("RUSTDESK_MCP_ENABLE") {
+        return matches!(v.as_str(), "1" | "true" | "Y" | "yes");
+    }
     let value = LocalConfig::get_option(MCP_ENABLE_OPTION);
     if value.is_empty() {
         LocalConfig::get_option(MCP_ENABLE_OPTION_LEGACY) == "Y"
@@ -926,6 +965,126 @@ fn ensure_mcp_enabled() -> Result<(), String> {
         Err("MCP server is disabled. Enable it in Settings -> Security -> Enable MCP server."
             .to_string())
     }
+}
+
+// ======================= Owned-bridge additions =======================
+// Local auth (the reference endpoint has none) + the three tools the reference
+// lacks: close_session, get_session_status, list_sessions.
+
+fn expected_mcp_token() -> Option<String> {
+    if let Ok(t) = std::env::var("RUSTDESK_MCP_TOKEN") {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    let t = LocalConfig::get_option("mcp-auth-token");
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// True if auth is not configured, or the Authorization header matches the token
+/// (raw shared secret or `Bearer <token>`). Header keys are already lowercased.
+fn check_mcp_auth(request: &HttpRequest) -> bool {
+    match expected_mcp_token() {
+        None => true,
+        Some(expected) => request
+            .headers
+            .get("authorization")
+            .map(|h| {
+                let h = h.trim();
+                constant_time_eq(h, &expected) || constant_time_eq(h, &format!("Bearer {expected}"))
+            })
+            .unwrap_or(false),
+    }
+}
+
+fn registry_lock() -> std::sync::MutexGuard<'static, HashMap<String, DesktopSessionHandle>> {
+    DESKTOP_SESSION_REGISTRY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+}
+
+/// Real teardown (the reference only soft-closes). Closes the RustDesk connection
+/// and removes our handle (the reference never removes handles).
+fn close_session(session_handle: &str) -> Result<Value, String> {
+    ensure_mcp_enabled()?;
+    let actual = resolve_actual_session_any(session_handle)?;
+    flutter_ffi::session_close(actual);
+    registry_lock().remove(session_handle);
+    Ok(json!({ "success": true, "session": session_handle, "closed": true }))
+}
+
+/// Live connection status from `agent_bridge_list_sessions()` (only lists live
+/// sessions), not the possibly-stale registry field.
+fn get_session_status(session_handle: &str) -> Result<Value, String> {
+    ensure_mcp_enabled()?;
+    let peer_id = registry_lock().get(session_handle).map(|h| h.peer_id.clone());
+    let Some(peer_id) = peer_id else {
+        return Ok(json!({
+            "success": true, "session": session_handle, "state": "unknown", "connected": false
+        }));
+    };
+    let live = resolve_actual_session_any(session_handle)
+        .ok()
+        .and_then(|sid| flutter::agent_bridge_list_sessions().into_iter().find(|s| s.session_id == sid));
+    let mut out = json!({
+        "success": true,
+        "session": session_handle,
+        "peerId": peer_id,
+        "state": if live.is_some() { "connected" } else { "connecting_or_closed" },
+        "connected": live.is_some(),
+    });
+    if let Some(snap) = live {
+        out["display"] = json!(snap.display);
+        out["displays"] = json!(snap
+            .displays
+            .iter()
+            .map(|d| json!({ "index": d.index, "width": d.width, "height": d.height }))
+            .collect::<Vec<_>>());
+    }
+    Ok(out)
+}
+
+/// The MCP handles this bridge knows, each tagged with live connectivity.
+fn list_sessions() -> Result<Value, String> {
+    ensure_mcp_enabled()?;
+    let live: HashSet<SessionID> = flutter::agent_bridge_list_sessions()
+        .iter()
+        .map(|s| s.session_id)
+        .collect();
+    // Snapshot the registry under the lock, then resolve (which re-locks) after.
+    let handles: Vec<(String, String, String)> = registry_lock()
+        .iter()
+        .map(|(h, i)| (h.clone(), i.peer_id.clone(), format!("{:?}", i.conn_type)))
+        .collect();
+    let mut sessions = Vec::new();
+    for (handle, peer_id, conn_type) in handles {
+        let connected = resolve_actual_session_any(&handle)
+            .ok()
+            .map(|sid| live.contains(&sid))
+            .unwrap_or(false);
+        sessions.push(json!({
+            "session": handle, "peerId": peer_id, "connType": conn_type, "connected": connected
+        }));
+    }
+    let count = sessions.len();
+    Ok(json!({ "success": true, "sessions": sessions, "count": count }))
 }
 
 fn desktop_session(session_handle: &str) -> Result<FlutterSession, String> {
