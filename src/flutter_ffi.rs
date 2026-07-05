@@ -80,6 +80,8 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
     {
         // core_main's init_log does not work for flutter since it is only applied to its load_library in main.c
         hbb_common::init_log(false, "flutter_ffi");
+        // Owned bridge: start the MCP HTTP server (per-request enable/auth gated).
+        crate::agent_bridge::start_server_once();
     }
 }
 

@@ -2036,6 +2036,125 @@ pub(super) fn session_update_virtual_display(session: &FlutterSession, index: i3
     }
 }
 
+// ===================== Owned bridge: session/frame snapshots =====================
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Debug, Clone)]
+pub struct AgentBridgeDisplaySnapshot {
+    pub index: usize,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Debug, Clone)]
+pub struct AgentBridgeSessionSnapshot {
+    pub session_id: SessionID,
+    pub peer_id: String,
+    pub conn_type: ConnType,
+    pub display: usize,
+    pub width: u32,
+    pub height: u32,
+    pub displays: Vec<AgentBridgeDisplaySnapshot>,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Debug, Clone)]
+pub struct AgentBridgeFrameSnapshot {
+    pub session_id: SessionID,
+    pub display: usize,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn agent_bridge_list_sessions() -> Vec<AgentBridgeSessionSnapshot> {
+    let mut snapshots = Vec::new();
+    for session in sessions::get_sessions() {
+        let peer_id = session.get_id().to_string();
+        let conn_type = session.lc.read().unwrap().conn_type;
+        let peer_info = session.ui_handler.peer_info.read().unwrap().clone();
+        let handlers = session.ui_handler.session_handlers.read().unwrap();
+        for (session_id, handler) in handlers.iter() {
+            if handler.event_stream.is_none() {
+                continue;
+            }
+            let display = agent_bridge_display_for_handler(handler, &peer_info);
+            let (width, height) = agent_bridge_display_size(&peer_info, display);
+            snapshots.push(AgentBridgeSessionSnapshot {
+                session_id: *session_id,
+                peer_id: peer_id.clone(),
+                conn_type,
+                display,
+                width,
+                height,
+                displays: agent_bridge_session_displays(&peer_info),
+            });
+        }
+    }
+    snapshots
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn agent_bridge_display_for_handler(handler: &SessionHandler, peer_info: &PeerInfo) -> usize {
+    handler.displays.first().copied().unwrap_or_else(|| {
+        if peer_info.current_display >= 0 {
+            peer_info.current_display as usize
+        } else {
+            0
+        }
+    })
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn agent_bridge_display_size(peer_info: &PeerInfo, display: usize) -> (u32, u32) {
+    let display = peer_info
+        .displays
+        .get(display)
+        .or_else(|| peer_info.displays.first());
+    display
+        .map(|display| (display.width.max(0) as u32, display.height.max(0) as u32))
+        .unwrap_or_default()
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn agent_bridge_session_displays(peer_info: &PeerInfo) -> Vec<AgentBridgeDisplaySnapshot> {
+    peer_info
+        .displays
+        .iter()
+        .enumerate()
+        .map(|(index, display)| AgentBridgeDisplaySnapshot {
+            index,
+            width: display.width.max(0) as u32,
+            height: display.height.max(0) as u32,
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn agent_bridge_get_frame(
+    session_id: &SessionID,
+    display: usize,
+) -> Option<AgentBridgeFrameSnapshot> {
+    let session = sessions::get_session_by_session_id(session_id)?;
+    let peer_info = session.ui_handler.peer_info.read().unwrap().clone();
+    let (width, height) = agent_bridge_display_size(&peer_info, display);
+    let mut rgba = session.ui_handler.display_rgbas.write().unwrap();
+    let rgba = rgba.get_mut(&display)?;
+    if !rgba.valid || rgba.data.is_empty() {
+        return None;
+    }
+    let data = rgba.data.clone();
+    rgba.valid = false;
+    Some(AgentBridgeFrameSnapshot {
+        session_id: *session_id,
+        display,
+        width,
+        height,
+        rgba: data,
+    })
+}
+
 // sessions mod is used to avoid the big lock of sessions' map.
 pub mod sessions {
 

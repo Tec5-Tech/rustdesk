@@ -772,6 +772,26 @@ impl<T: InvokeUiSession> Session<T> {
         }
     }
 
+    // Owned-bridge: the agent's own injected input. For v1 these delegate to the
+    // normal paths (master has no local-input-lock guard yet). When the
+    // should_drop_user_input guard is added, keep these as the *bypassing* path.
+    pub fn send_mouse_agent(
+        &self,
+        mask: i32,
+        x: i32,
+        y: i32,
+        alt: bool,
+        ctrl: bool,
+        shift: bool,
+        command: bool,
+    ) {
+        self.send_mouse(mask, x, y, alt, ctrl, shift, command);
+    }
+
+    pub fn send_key_event_agent(&self, evt: &KeyEvent) {
+        self.send_key_event(evt);
+    }
+
     pub fn send_key_event(&self, evt: &KeyEvent) {
         // mode: legacy(0), map(1), translate(2), auto(3)
 
