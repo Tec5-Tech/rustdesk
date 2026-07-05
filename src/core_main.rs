@@ -29,6 +29,16 @@ macro_rules! my_println{
 /// If it returns [`Some`], then the process will continue, and flutter gui will be started.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<Vec<String>> {
+    // Owned-bridge addition: let the MCP bridge run under its own app identity so
+    // it can coexist with a normal RustDesk client on the same host. This must
+    // happen before any config-path/IPC-pipe access, since both derive from
+    // APP_NAME (config dir `%APPDATA%/<APP_NAME>` and pipe `\\.\pipe\<APP_NAME>`).
+    if let Ok(name) = std::env::var("RUSTDESK_APP_NAME") {
+        let name = name.trim();
+        if !name.is_empty() {
+            *hbb_common::config::APP_NAME.write().unwrap() = name.to_owned();
+        }
+    }
     if !crate::common::global_init() {
         return None;
     }
