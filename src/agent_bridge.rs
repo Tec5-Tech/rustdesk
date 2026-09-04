@@ -538,6 +538,11 @@ fn open_desktop_session(peer_id: &str) -> Result<Value, String> {
         let session_handle = new_desktop_session_handle(peer_id, Some(snapshot.session_id));
         let connected = snapshot.width > 0 && snapshot.height > 0;
         let needs_password = !connected;
+        // Video is incremental: request a full (key) frame so the first
+        // get_desktop_frame after (re)attaching has real pixels, not an empty buffer.
+        if connected {
+            flutter_ffi::session_refresh(snapshot.session_id, snapshot.display);
+        }
         return Ok(json!({
             "success": true,
             "session": session_handle,
@@ -568,6 +573,12 @@ fn open_desktop_session(peer_id: &str) -> Result<Value, String> {
             .map(|remember| !remember)
             .unwrap_or(true)
     };
+
+    // Request a full (key) frame on connect so the first get_desktop_frame has
+    // real pixels rather than an empty incremental buffer.
+    if connected {
+        flutter_ffi::session_refresh(snapshot.session_id, snapshot.display);
+    }
 
     Ok(json!({
         "success": true,
@@ -770,9 +781,19 @@ fn get_desktop_frame(
             "display {display} is not available for desktop session '{session_id}'"
         ));
     }
-    let frame = wait_for_frame(session_id, display, FRAME_WAIT_TIMEOUT).ok_or_else(|| {
-        format!("no desktop frame is ready yet for session '{session_id}' display {display}")
-    })?;
+    let frame = match wait_for_frame(session_id, display, FRAME_WAIT_TIMEOUT) {
+        Some(frame) => frame,
+        None => {
+            // Nothing has repainted since connect (video is incremental), so the
+            // recorded buffer is empty. Ask the remote for a full (key) frame so
+            // the NEXT poll has real pixels, then report not-ready (the Python
+            // adapter maps this to a retryable SESSION_NOT_READY and re-polls).
+            flutter_ffi::session_refresh(session_id, display);
+            return Err(format!(
+                "no desktop frame is ready yet for session '{session_id}' display {display}"
+            ));
+        }
+    };
     let png = encode_png(frame.width, frame.height, &frame.rgba)?;
     let payload = json!({
         "success": true,
