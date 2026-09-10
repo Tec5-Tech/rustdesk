@@ -1008,6 +1008,19 @@ impl InvokeUiSession for FlutterHandler {
     fn on_connected(&self, _conn_type: ConnType) {}
 
     fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str, retry: bool) {
+        // Owned-bridge addition: remember the login outcome (wrong password /
+        // waiting for remote accept) so the MCP tools can report it.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let session_ids = self
+                .session_handlers
+                .read()
+                .unwrap()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            crate::agent_bridge::record_msgbox(&session_ids, msgtype, text);
+        }
         let has_retry = if retry { "true" } else { "" };
         self.push_event(
             "msgbox",

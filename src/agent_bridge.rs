@@ -45,6 +45,16 @@ static DESKTOP_SESSION_REGISTRY: OnceLock<Mutex<HashMap<String, DesktopSessionHa
 static FRAME_CACHE: OnceLock<Mutex<HashMap<(SessionID, usize), CachedFrame>>> = OnceLock::new();
 static LOCKED_REMOTE_INPUT_PEERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static TERMINAL_CACHE: OnceLock<Mutex<HashMap<(SessionID, i32), String>>> = OnceLock::new();
+/// Last login-related msgbox RustDesk raised per session (`type`, `text`), so the
+/// MCP tools can report the auth OUTCOME (wrong password / waiting for the
+/// remote user to accept) instead of only `connected`.
+static LOGIN_STATE_CACHE: OnceLock<Mutex<HashMap<SessionID, (String, String)>>> =
+    OnceLock::new();
+
+/// Msgbox types RustDesk raises when the submitted password was rejected.
+const MSGBOX_PASSWORD_REJECTED: &[&str] = &["re-input-password", "session-login-re-password"];
+/// Msgbox type raised while the remote side must click "Accept" (no password access).
+const MSGBOX_WAIT_REMOTE_ACCEPT: &str = "wait-remote-accept-nook";
 
 thread_local! {
     static AGENT_INPUT_BYPASS: Cell<u32> = const { Cell::new(0) };
@@ -599,11 +609,14 @@ fn input_password(session_handle: &str, password: &str) -> Result<Value, String>
     // master exposes password submission through Session::login (Data::Login),
     // which is what the Flutter UI uses; the reference fork's queue_password /
     // has_login_challenge staging methods do not exist here.
+    // Forget the outcome of a previous attempt so a stale rejection is not reported.
+    clear_login_state(session_id);
     session.login(String::new(), String::new(), password.to_string(), false);
-    let connected = wait_for_session_ready(session_id, SESSION_READY_TIMEOUT);
+    let connected = wait_for_session_ready_or_login_outcome(session_id, SESSION_READY_TIMEOUT);
     let snapshot = session_snapshot(session_id);
+    let login = login_state_json(session_id, connected);
 
-    Ok(json!({
+    let mut out = json!({
         "success": true,
         "session": session_handle,
         "actualSession": session_id.to_string(),
@@ -613,7 +626,87 @@ fn input_password(session_handle: &str, password: &str) -> Result<Value, String>
             .as_ref()
             .map(|snapshot| displays_json(&snapshot.displays))
             .unwrap_or_else(|| json!([]))
-    }))
+    });
+    merge_json(&mut out, login);
+    Ok(out)
+}
+
+/// Record the login-related msgbox RustDesk raised for these sessions (called
+/// from the Flutter UI handler, which sees every msgbox the client emits).
+pub fn record_msgbox(session_ids: &[SessionID], msgtype: &str, text: &str) {
+    let cache = LOGIN_STATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut cache) = cache.lock() else {
+        return;
+    };
+    for session_id in session_ids {
+        cache.insert(*session_id, (msgtype.to_string(), text.to_string()));
+    }
+}
+
+fn clear_login_state(session_id: SessionID) {
+    if let Some(cache) = LOGIN_STATE_CACHE.get() {
+        if let Ok(mut cache) = cache.lock() {
+            cache.remove(&session_id);
+        }
+    }
+}
+
+fn last_msgbox(session_id: SessionID) -> Option<(String, String)> {
+    LOGIN_STATE_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok().and_then(|cache| cache.get(&session_id).cloned()))
+}
+
+/// `rejected` / `needsAccept` (+ `lastMsgbox`, `loginError`) for a session. Once the
+/// session is connected the flags are always false, whatever msgbox came earlier.
+fn login_state_json(session_id: SessionID, connected: bool) -> Value {
+    let Some((msgtype, text)) = last_msgbox(session_id) else {
+        return json!({ "rejected": false, "needsAccept": false });
+    };
+    let rejected = !connected && MSGBOX_PASSWORD_REJECTED.contains(&msgtype.as_str());
+    let needs_accept = !connected && msgtype == MSGBOX_WAIT_REMOTE_ACCEPT;
+    let mut out = json!({
+        "rejected": rejected,
+        "needsAccept": needs_accept,
+        "lastMsgbox": msgtype,
+    });
+    if !connected && msgtype == "error" {
+        out["loginError"] = json!(text);
+    }
+    out
+}
+
+fn merge_json(target: &mut Value, extra: Value) {
+    if let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// Like `wait_for_session_ready`, but returns early (false) as soon as RustDesk
+/// reports a rejected password or a click-to-accept wait, so a wrong password
+/// does not cost the full timeout.
+fn wait_for_session_ready_or_login_outcome(session_id: SessionID, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if session_snapshot(session_id)
+            .map(|snapshot| snapshot.width > 0 && snapshot.height > 0)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if let Some((msgtype, _)) = last_msgbox(session_id) {
+            if MSGBOX_PASSWORD_REJECTED.contains(&msgtype.as_str())
+                || msgtype == MSGBOX_WAIT_REMOTE_ACCEPT
+                || msgtype == "error"
+            {
+                return false;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
 }
 
 fn open_terminal_session(peer_id: &str, rows: u32, cols: u32) -> Result<Value, String> {
@@ -1041,6 +1134,7 @@ fn close_session(session_handle: &str) -> Result<Value, String> {
     ensure_mcp_enabled()?;
     let actual = resolve_actual_session_any(session_handle)?;
     flutter_ffi::session_close(actual);
+    clear_login_state(actual);
     registry_lock().remove(session_handle);
     Ok(json!({ "success": true, "session": session_handle, "closed": true }))
 }
@@ -1055,8 +1149,8 @@ fn get_session_status(session_handle: &str) -> Result<Value, String> {
             "success": true, "session": session_handle, "state": "unknown", "connected": false
         }));
     };
-    let live = resolve_actual_session_any(session_handle)
-        .ok()
+    let actual = resolve_actual_session_any(session_handle).ok();
+    let live = actual
         .and_then(|sid| flutter::agent_bridge_list_sessions().into_iter().find(|s| s.session_id == sid));
     let mut out = json!({
         "success": true,
@@ -1065,6 +1159,9 @@ fn get_session_status(session_handle: &str) -> Result<Value, String> {
         "state": if live.is_some() { "connected" } else { "connecting_or_closed" },
         "connected": live.is_some(),
     });
+    if let Some(sid) = actual {
+        merge_json(&mut out, login_state_json(sid, live.is_some()));
+    }
     if let Some(snap) = live {
         out["display"] = json!(snap.display);
         out["displays"] = json!(snap
