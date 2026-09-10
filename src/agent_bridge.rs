@@ -199,13 +199,14 @@ fn tools_list() -> Value {
             ),
             tool_def(
                 "open_terminal_session",
-                "Open a RustDesk terminal session and create terminal id 1.",
+                "Open a RustDesk terminal session and create terminal id 1. Set admin=true for an elevated (SYSTEM) terminal, then submit OS admin credentials via input_password (osUsername/osPassword).",
                 json!({
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" },
                         "rows": { "type": "integer", "minimum": 1 },
-                        "cols": { "type": "integer", "minimum": 1 }
+                        "cols": { "type": "integer", "minimum": 1 },
+                        "admin": { "type": "boolean" }
                     },
                     "required": ["id"],
                     "additionalProperties": false
@@ -283,7 +284,9 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {
                         "session": { "type": "string" },
-                        "password": { "type": "string" }
+                        "password": { "type": "string" },
+                        "osUsername": { "type": "string" },
+                        "osPassword": { "type": "string" }
                     },
                     "required": ["session", "password"],
                     "additionalProperties": false
@@ -416,6 +419,7 @@ fn handle_tool_call(params: Option<&Value>) -> Result<Value, ProtocolError> {
             required_str(args, "id")?,
             optional_u32(args, "rows")?.unwrap_or(30),
             optional_u32(args, "cols")?.unwrap_or(120),
+            optional_bool(args, "admin")?.unwrap_or(false),
         )),
         "terminal_input" => tool_payload_result(terminal_input(
             required_str(args, "session")?,
@@ -436,6 +440,8 @@ fn handle_tool_call(params: Option<&Value>) -> Result<Value, ProtocolError> {
         "input_password" => tool_payload_result(input_password(
             required_str(args, "session")?,
             required_str(args, "password")?,
+            optional_str(args, "osUsername")?.unwrap_or(""),
+            optional_str(args, "osPassword")?.unwrap_or(""),
         )),
         "get_desktop_frame" => get_desktop_frame_response(
             required_str(args, "session")?,
@@ -602,16 +608,30 @@ fn open_desktop_session(peer_id: &str) -> Result<Value, String> {
     }))
 }
 
-fn input_password(session_handle: &str, password: &str) -> Result<Value, String> {
+fn input_password(
+    session_handle: &str,
+    password: &str,
+    os_username: &str,
+    os_password: &str,
+) -> Result<Value, String> {
     ensure_mcp_enabled()?;
     let session_id = resolve_actual_session_any(session_handle)?;
     let session = any_session(session_handle)?;
     // master exposes password submission through Session::login (Data::Login),
     // which is what the Flutter UI uses; the reference fork's queue_password /
     // has_login_challenge staging methods do not exist here.
+    // os_username/os_password are the OS credentials for an ELEVATED terminal
+    // (empty for a normal desktop/terminal session); RustDesk forwards them as
+    // the login request's os_login, which the controlled host uses to run the
+    // terminal shell with the SYSTEM token (see connection.rs fill_terminal_user_token).
     // Forget the outcome of a previous attempt so a stale rejection is not reported.
     clear_login_state(session_id);
-    session.login(String::new(), String::new(), password.to_string(), false);
+    session.login(
+        os_username.to_string(),
+        os_password.to_string(),
+        password.to_string(),
+        false,
+    );
     let connected = wait_for_session_ready_or_login_outcome(session_id, SESSION_READY_TIMEOUT);
     let snapshot = session_snapshot(session_id);
     let login = login_state_json(session_id, connected);
@@ -709,11 +729,21 @@ fn wait_for_session_ready_or_login_outcome(session_id: SessionID, timeout: Durat
     false
 }
 
-fn open_terminal_session(peer_id: &str, rows: u32, cols: u32) -> Result<Value, String> {
+fn open_terminal_session(peer_id: &str, rows: u32, cols: u32, admin: bool) -> Result<Value, String> {
     ensure_mcp_enabled()?;
     clear_local_input_lock_for_peer(peer_id);
     let before = terminal_session_ids(peer_id);
-    crate::run_me(vec!["--terminal", peer_id]).map_err(|error| {
+    // `admin` opens an ELEVATED terminal: the spawned `--terminal` process reads
+    // IS_TERMINAL_ADMIN at session creation (see client.rs) and negotiates the
+    // admin terminal service. The caller must then supply OS credentials of a
+    // local administrator via `input_password` (osUsername/osPassword); the
+    // controlled host runs the shell with the SYSTEM token, no UAC prompt.
+    let launch = if admin {
+        crate::run_me_with_env(vec!["--terminal", peer_id], &[("IS_TERMINAL_ADMIN", "Y")])
+    } else {
+        crate::run_me(vec!["--terminal", peer_id])
+    };
+    launch.map_err(|error| {
         format!("failed to launch the RustDesk terminal connection for '{peer_id}': {error}")
     })?;
 
@@ -736,6 +766,10 @@ fn open_terminal_session(peer_id: &str, rows: u32, cols: u32) -> Result<Value, S
         "peerId": peer_id,
         "terminalId": terminal_id,
         "needsPassword": needs_password,
+        "admin": admin,
+        // An elevated terminal always needs OS admin credentials submitted via
+        // input_password before commands run with SYSTEM privileges.
+        "needsOsLogin": admin,
         "rows": rows.max(10),
         "cols": cols.max(20)
     }))
@@ -1553,6 +1587,29 @@ fn required_u32(args: &Map<String, Value>, key: &str) -> Result<u32, ProtocolErr
             format!("'{key}' is outside the supported integer range"),
         )
     })
+}
+
+fn optional_str<'a>(
+    args: &'a Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, ProtocolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| ProtocolError::new(-32602, format!("'{key}' must be a string"))),
+    }
+}
+
+fn optional_bool(args: &Map<String, Value>, key: &str) -> Result<Option<bool>, ProtocolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| ProtocolError::new(-32602, format!("'{key}' must be a boolean"))),
+    }
 }
 
 fn optional_u32(args: &Map<String, Value>, key: &str) -> Result<Option<u32>, ProtocolError> {

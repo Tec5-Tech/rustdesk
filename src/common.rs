@@ -818,6 +818,26 @@ pub fn run_me<T: AsRef<std::ffi::OsStr>>(args: Vec<T>) -> std::io::Result<std::p
     result
 }
 
+/// Like `run_me`, but sets extra environment variables on the child only (no
+/// AppImage / foreground special-casing — used by the MCP agent bridge to spawn
+/// `--terminal` with `IS_TERMINAL_ADMIN=Y` without polluting this process's env).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn run_me_with_env<T: AsRef<std::ffi::OsStr>>(
+    args: Vec<T>,
+    envs: &[(&str, &str)],
+) -> std::io::Result<std::process::Child> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let result = cmd.args(&args).spawn();
+    if let Err(err) = result.as_ref() {
+        log::error!("run_me_with_env: {err:?}");
+    }
+    result
+}
+
 #[inline]
 pub fn username() -> String {
     // fix bug of whoami
